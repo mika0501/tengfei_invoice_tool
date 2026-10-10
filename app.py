@@ -8,13 +8,11 @@ st.set_page_config(
     page_title="上海騰飛發票表格轉換工具", page_icon="📋", layout="wide"
 )
 st.title("📋 上海騰飛 (Tengfei) 發票表格自動轉 Excel 工具")
-st.caption(
-    "自動解析發票表頭資訊（發票號碼、日期等）與下方明細清單（數量、料號、PO、品名規格、單價、總額），並匯出完整 Excel！"
-)
+st.caption("已升級彈性切分演算法：完整抓取所有明細品項並轉為標準 Excel！")
 
 
 def parse_tengfei_invoice(file_bytes):
-    """解析上海騰飛發票檔案，提取表頭與商品明細"""
+    """解析上海騰飛發票檔案"""
     full_text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -35,50 +33,57 @@ def parse_tengfei_invoice(file_bytes):
     )
     invoice_date = inv_date_match.group(1).strip() if inv_date_match else ""
 
-    terms_match = re.search(
-        r"PAYMENT\s*TERM\s*([^\n\r]+)", full_text, re.IGNORECASE
-    )
-    payment_term = terms_match.group(1).strip() if terms_match else ""
-
-    total_amt_match = re.search(
-        r"(?:US\$|USD)\s*([0-9,]+\.[0-9]{2})", full_text
-    )
-    invoice_total = (
-        f"${total_amt_match.group(1)}" if total_amt_match else ""
-    )
-
-    # ================= 2. 表格項目多列解析 =================
-    # 截取表格區域（QUANTITY 到 COUNTRY of / SUBTOTAL 之間）
+    # ================= 2. 表格明細區塊拆解 =================
+    # 截取表格區域
     table_block_match = re.search(
-        r"QUANTITY[\s\S]*?(?=COUNTRY\s*of|SUBTOTAL|THIS\s*TOTAL)",
+        r"HIPPING\s*MARK[\s\S]*?(?=COUNTRY\s*of|SUBTOTAL|THIS\s*TOTAL)",
         full_text,
         re.IGNORECASE,
     )
     table_text = table_block_match.group(0) if table_block_match else full_text
 
-    # 針對每一筆紀錄的模式匹配
-    # 項目特徵：數量(數字 PCS) -> 描述說明 -> 兩組 10 碼數字 (Part No & PO No) -> 單價 -> 總金額
-    item_pattern = re.compile(
-        r"(\d+\s*PCS)[\s\S]*?\|\s*([^\n\r\|]+)[\s\S]*?(\b\d{10}\b)[\s\S]*?(\b\d{10}\b)[\s\S]*?\|\s*USD\s*([0-9,\.]+)[\s\S]*?\|\s*USD\s*([0-9,\.]+)",
+    # 依照金額標記 "| USD" 或換行模式做彈性切割
+    # 每個項目通常結尾於第二個 "| USD xxx" (AMOUNT)
+    # 我們利用正則切分出每一個獨立明細段落
+    pattern = re.compile(
+        r"(?P<qty>\d+[\s\n]*PCS)[\s\S]*?\|\s*(?P<desc>[A-Z0-9\s\.\*'\-,]+?)[\s\n]+(?P<codes>(?:\d{10}[\s\n]*)+)[\s\S]*?\|\s*USD\s*(?P<price>[0-9,\.]+)[\s\S]*?\|\s*USD\s*(?P<amt>[0-9,\.]+)",
         re.IGNORECASE,
     )
 
     items = []
-    for match in item_pattern.finditer(table_text):
-        qty = match.group(1).strip()
-        description = match.group(2).strip()
-        code1 = match.group(3).strip()
-        code2 = match.group(4).strip()
-        unit_price = f"${match.group(5).strip()}"
-        amount = f"${match.group(6).strip()}"
+    for match in pattern.finditer(table_text):
+        # 處理數量
+        qty_raw = match.group("qty")
+        qty = re.sub(r"\s+", " ", qty_raw).strip()
 
-        # 區分 Part No (通常 33 開頭) 與 PO Number (通常 45 開頭)
-        if code1.startswith("45") or not code2.startswith("45"):
-            po_number = code1 if code1.startswith("45") else code2
-            part_number = code2 if code1.startswith("45") else code1
-        else:
-            part_number = code1
-            po_number = code2
+        # 處理描述
+        desc = match.group("desc").strip().replace("\n", " ")
+
+        # 處理 10 碼數字 (PO Number 通常是 45 開頭, Part Number 通常是 33 開頭)
+        codes_text = match.group("codes")
+        found_codes = re.findall(r"\b\d{10}\b", codes_text)
+
+        po_number = ""
+        part_number = ""
+        for c in found_codes:
+            if c.startswith("45"):
+                po_number = c
+            else:
+                part_number = c
+
+        # 若沒特別分開，依順序帶入
+        if not po_number and len(found_codes) >= 2:
+            po_number = found_codes[1]
+            part_number = found_codes[0]
+        elif not po_number and len(found_codes) == 1:
+            if found_codes[0].startswith("45"):
+                po_number = found_codes[0]
+            else:
+                part_number = found_codes[0]
+
+        # 處理金額
+        unit_price = f"${match.group('price').strip().replace(',', '.')}"
+        amount = f"${match.group('amt').strip().replace(',', '.')}"
 
         items.append(
             {
@@ -87,12 +92,76 @@ def parse_tengfei_invoice(file_bytes):
                 "QUANTITY": qty,
                 "PART NUMBER": part_number,
                 "PO NUMBER": po_number,
-                "DESCRIPTION": description,
+                "DESCRIPTION": desc,
                 "UNIT PRICE": unit_price,
                 "AMOUNT": amount,
-                "PAYMENT TERM": payment_term,
             }
         )
+
+    # 備援演算法：如果正則未抓滿，啟用逐行狀態機備援
+    if len(items) == 0:
+        lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+        cur_qty = ""
+        cur_desc = ""
+        cur_codes = []
+        cur_prices = []
+
+        for line in lines:
+            # 檢查數量
+            qty_chk = re.match(r"^(\d+\s*PCS)$", line, re.IGNORECASE)
+            if qty_chk:
+                # 若已有上一筆，先結算
+                if cur_qty and (cur_codes or cur_prices):
+                    po = next((c for c in cur_codes if c.startswith("45")), cur_codes[1] if len(cur_codes) > 1 else "")
+                    pn = next((c for c in cur_codes if not c.startswith("45")), cur_codes[0] if cur_codes else "")
+                    up = f"${cur_prices[0]}" if len(cur_prices) > 0 else ""
+                    am = f"${cur_prices[1]}" if len(cur_prices) > 1 else ""
+                    items.append({
+                        "INVOICE NUMBER": invoice_number,
+                        "INVOICE DATE": invoice_date,
+                        "QUANTITY": cur_qty,
+                        "PART NUMBER": pn,
+                        "PO NUMBER": po,
+                        "DESCRIPTION": cur_desc,
+                        "UNIT PRICE": up,
+                        "AMOUNT": am,
+                    })
+                cur_qty = qty_chk.group(1)
+                cur_desc = ""
+                cur_codes = []
+                cur_prices = []
+                continue
+
+            if "|" in line and "USD" not in line:
+                cur_desc = line.replace("|", "").strip()
+            
+            # 抓取 10 碼數字
+            codes = re.findall(r"\b\d{10}\b", line)
+            if codes:
+                cur_codes.extend(codes)
+
+            # 抓取 USD 金額
+            if "USD" in line:
+                prices = re.findall(r"USD\s*([0-9,\.]+)", line)
+                for p in prices:
+                    cur_prices.append(p.replace(",", "."))
+
+        # 結算最後一筆
+        if cur_qty:
+            po = next((c for c in cur_codes if c.startswith("45")), cur_codes[1] if len(cur_codes) > 1 else "")
+            pn = next((c for c in cur_codes if not c.startswith("45")), cur_codes[0] if cur_codes else "")
+            up = f"${cur_prices[0]}" if len(cur_prices) > 0 else ""
+            am = f"${cur_prices[1]}" if len(cur_prices) > 1 else ""
+            items.append({
+                "INVOICE NUMBER": invoice_number,
+                "INVOICE DATE": invoice_date,
+                "QUANTITY": cur_qty,
+                "PART NUMBER": pn,
+                "PO NUMBER": po,
+                "DESCRIPTION": cur_desc,
+                "UNIT PRICE": up,
+                "AMOUNT": am,
+            })
 
     return items
 
