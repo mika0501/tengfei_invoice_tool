@@ -16,14 +16,40 @@ if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe"):
 st.set_page_config(
     page_title="上海騰飛發票表格轉換工具",
     page_icon="📋",
-    layout="wide"
+    layout="wide",
 )
-st.title("📋 上海騰飛發票表格自動轉 Excel 工具（OCR + 逐行精準版）")
-st.caption("支援紙本掃描 PDF：先以 300 DPI 影像增強去除雜訊執行 OCR，再以狀態機對齊每個商品明細！")
+
+st.title("📋 上海騰飛發票表格自動轉 Excel 工具（精確防呆版）")
+st.caption(
+    "結合 300 DPI 影像增強 OCR 掃描 ＋ 逐行狀態機，完整容錯折行與黏字！"
+)
+
+# ==================== 1. 檔案上傳區塊（置頂醒目顯示） ====================
+st.markdown("---")
+col_upload1, col_upload2 = st.columns(2)
+
+with col_upload1:
+    st.markdown("### 📥 步驟 1：上傳 PDF 發票檔案（必填）")
+    uploaded_files = st.file_uploader(
+        "請點擊瀏覽或將 PDF 檔案直接拖曳至此區域（可選多個檔案）",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="main_pdf_uploader",
+    )
+
+with col_upload2:
+    st.markdown("### 📑 步驟 2：上傳現有 Excel 檔案（選填，累加用）")
+    existing_file = st.file_uploader(
+        "若要將本次辨識的明細接續累加至既有的 Excel 表格，請在此上傳",
+        type=["xlsx", "xls"],
+        key="existing_excel_uploader",
+    )
+st.markdown("---")
 
 
+# ==================== 2. 資料清洗與 OCR 核心 ====================
 def clean_price(val_str):
-    """將金額統一轉為乾淨的小數點格式"""
+    """清理金額字串中的逗號與雜訊"""
     if not val_str:
         return ""
     val = val_str.replace(" ", "").strip()
@@ -35,66 +61,93 @@ def clean_price(val_str):
 
 
 def extract_text_with_ocr(file_bytes):
-    """提取文字；若文字過少則強制執行 300 DPI 影像增強 + OCR"""
+    """提取文字：若數位層文字不足或格式破碎，強制走 300 DPI OCR 影像辨識"""
     full_text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             txt = page.extract_text() or ""
-            # 如果頁面純文字少於 60 字元，判定為掃描圖檔，啟動 OCR
-            if len(txt.strip()) < 60:
+            # 若文字少於 400 字元，表示缺少完整文字層，強制啟動高解析度 OCR
+            if len(txt.strip()) < 400:
                 try:
                     img = page.to_image(resolution=300).original
-                    # 影像前處理：轉灰階並增強對比度，去除傳真掃描雜點
                     img = img.convert("L")
                     enhancer = ImageEnhance.Contrast(img)
                     img = enhancer.enhance(2.2)
                     ocr_res = pytesseract.image_to_string(img, lang="eng")
-                    if ocr_res:
+                    if ocr_res and len(ocr_res.strip()) > len(txt.strip()):
                         txt = ocr_res
                 except Exception as e:
-                    st.warning(f"OCR 執行提示: {e}")
+                    st.warning(f"OCR 影像掃描提示: {e}")
             full_text += txt + "\n"
     return full_text
 
 
 def parse_tengfei_invoice(file_bytes):
-    # 執行提取（純數位或 OCR 掃描）
+    """解析發票內容並進行狀態機對齊"""
     full_text = extract_text_with_ocr(file_bytes)
 
     # 1. 表頭核心欄位
-    inv_num_match = re.search(r"INVOICE\s*NUMBER\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE)
+    inv_num_match = re.search(
+        r"INVOICE\s*NUMBER\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+    )
     invoice_number = inv_num_match.group(1).strip() if inv_num_match else ""
 
-    inv_date_match = re.search(r"INVOICE\s*DATE\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})", full_text, re.IGNORECASE)
+    inv_date_match = re.search(
+        r"INVOICE\s*DATE\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+        full_text,
+        re.IGNORECASE,
+    )
     invoice_date = inv_date_match.group(1).strip() if inv_date_match else ""
 
-    # 2. 截取商品表格區間
-    table_block_match = re.search(r"HIPPING\s*MARK[\s\S]*?(?=COUNTRY\s*of|SUBTOTAL|THIS\s*TOTAL)", full_text, re.IGNORECASE)
+    # 2. 定位商品表格核心區域
+    table_block_match = re.search(
+        r"HIPPING\s*MARK[\s\S]*?(?=COUNTRY\s*of|SUBTOTAL|THIS\s*TOTAL)",
+        full_text,
+        re.IGNORECASE,
+    )
     table_text = table_block_match.group(0) if table_block_match else full_text
 
-    # 預先處理折行的 "30\nPCS"
-    table_text = re.sub(r"(\d+)\s*\n\s*PCS", r"\1 PCS", table_text, flags=re.IGNORECASE)
+    # 修正折行或黏在一起的 PCS (例如 30\nPCS 轉 30 PCS，1120PCS 轉 1120 PCS)
+    table_text = re.sub(
+        r"(\d+)\s*\n\s*PCS", r"\1 PCS", table_text, flags=re.IGNORECASE
+    )
+    table_text = re.sub(
+        r"(\d+)(PCS|PCE)", r"\1 \2", table_text, flags=re.IGNORECASE
+    )
 
-    raw_lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+    raw_lines = [
+        line.strip() for line in table_text.splitlines() if line.strip()
+    ]
 
     items = []
     current_item = None
 
     for line in raw_lines:
-        # 排除表頭文字行
-        if any(h in line.upper() for h in ["HIPPING MARK", "QUANTITY", "PART NUMBER", "PO NUMBER", "UNIT PRICE", "AMOUNT"]):
+        # 排除表頭行
+        if any(
+            h in line.upper()
+            for h in [
+                "HIPPING MARK",
+                "QUANTITY",
+                "PART NUMBER",
+                "PO NUMBER",
+                "UNIT PRICE",
+                "AMOUNT",
+            ]
+        ):
             continue
 
-        # 遇到新的數量行 (例如 30 PCS, 120 PCS)
-        qty_match = re.search(r"\b(\d+\s*PCS)\b", line, re.IGNORECASE)
+        # 遇到數量行判定為新項目起點 (例如 30 PCS, 1120 PCS)
+        qty_match = re.search(
+            r"\b(\d+)\s*(PCS|PCE)\b", line, re.IGNORECASE
+        )
         if qty_match and not any(k in line.upper() for k in ["USD", "CASE"]):
-            # 結算上一筆
             if current_item and current_item["QUANTITY"]:
                 items.append(current_item)
             current_item = {
                 "INVOICE NUMBER": invoice_number,
                 "INVOICE DATE": invoice_date,
-                "QUANTITY": qty_match.group(1).upper(),
+                "QUANTITY": f"{qty_match.group(1)} {qty_match.group(2).upper()}",
                 "PART NUMBER": "",
                 "PO NUMBER": "",
                 "DESCRIPTION": "",
@@ -106,17 +159,22 @@ def parse_tengfei_invoice(file_bytes):
         if not current_item:
             continue
 
-        # 抓取品名 (帶有 | 且包含英文，但不是 USD 金額行)
+        # 品名規格：包含直槓 | 且不是金額行
         if "|" in line and "USD" not in line.upper():
             desc_clean = line.replace("|", "").strip()
-            if desc_clean and not desc_clean.startswith("45") and not desc_clean.startswith("33"):
+            # 排除純代碼數字
+            if (
+                desc_clean
+                and not desc_clean.startswith("45")
+                and not desc_clean.startswith("33")
+            ):
                 if not current_item["DESCRIPTION"]:
                     current_item["DESCRIPTION"] = desc_clean
                 else:
                     current_item["DESCRIPTION"] += " " + desc_clean
             continue
 
-        # 抓取 10 碼代碼 (45 開頭為 PO，33 開頭為 Part No)
+        # 10 碼代碼自動分流 (45 開頭分配給 PO，33 或其他開頭分配給 Part No)
         codes = re.findall(r"\b\d{10}\b", line)
         if codes:
             for c in codes:
@@ -131,7 +189,7 @@ def parse_tengfei_invoice(file_bytes):
                         current_item["PO NUMBER"] = c
             continue
 
-        # 抓取 USD 金額
+        # USD 金額
         if "USD" in line.upper():
             prices = re.findall(r"USD\s*([0-9,\.]+)", line, re.IGNORECASE)
             for p in prices:
@@ -142,11 +200,10 @@ def parse_tengfei_invoice(file_bytes):
                     current_item["AMOUNT"] = clean_p
             continue
 
-    # 結算最後一筆
     if current_item and current_item["QUANTITY"]:
         items.append(current_item)
 
-    # 校正單價與總額反置問題 (單價通常小於總額)
+    # 單價與金額反置校驗
     for itm in items:
         try:
             up_num = float(itm["UNIT PRICE"].replace("$", ""))
@@ -154,39 +211,23 @@ def parse_tengfei_invoice(file_bytes):
             if up_num > am_num and itm["QUANTITY"]:
                 qty_digits = re.search(r"\d+", itm["QUANTITY"])
                 if qty_digits and float(qty_digits.group(0)) > 1:
-                    itm["UNIT PRICE"], itm["AMOUNT"] = itm["AMOUNT"], itm["UNIT PRICE"]
+                    itm["UNIT PRICE"], itm["AMOUNT"] = (
+                        itm["AMOUNT"],
+                        itm["UNIT PRICE"],
+                    )
         except Exception:
             pass
 
     return items
 
 
-# ==================== 網頁介面 ====================
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("### 步驟 1：(選填) 上傳現有 Excel 檔案")
-    existing_file = st.file_uploader(
-        "若要將新發票明細累加至現有 Excel，請在此上傳",
-        type=["xlsx", "xls"],
-        key="existing_excel"
-    )
-
-with col2:
-    st.markdown("### 步驟 2：上傳 PDF 發票檔案")
-    uploaded_files = st.file_uploader(
-        "請選擇或拖曳上海騰飛 PDF 發票（支援多個檔案同時上傳）",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pdf_files"
-    )
-
+# ==================== 3. 處理與輸出結果 ====================
 if uploaded_files:
     all_records = []
     progress_bar = st.progress(0)
 
     for i, file in enumerate(uploaded_files):
-        with st.spinner(f"正在執行第 {i+1} 份 PDF 的 OCR 影像掃描辨識中..."):
+        with st.spinner(f"正在對「{file.name}」進行高解析 OCR 辨識與狀態機對齊..."):
             records = parse_tengfei_invoice(file.read())
             all_records.extend(records)
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -197,7 +238,9 @@ if uploaded_files:
         try:
             old_df = pd.read_excel(existing_file)
             final_df = pd.concat([old_df, new_df], ignore_index=True)
-            st.success(f"🎉 成功解析 {len(new_df)} 筆明細，並已合併至原有的 Excel！目前累積共 {len(final_df)} 筆資料。")
+            st.success(
+                f"🎉 成功解析 {len(new_df)} 筆明細，並已合併至原有的 Excel！目前累積共 {len(final_df)} 筆資料。"
+            )
         except Exception as e:
             st.error(f"讀取既有 Excel 失敗: {e}")
             final_df = new_df
@@ -218,5 +261,5 @@ if uploaded_files:
         data=excel_data,
         file_name="Tengfei_發票明細表.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
+        type="primary",
     )
